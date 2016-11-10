@@ -105,7 +105,7 @@ class LeakyReLUOp : public Operator {
       }
       case leakyrelu::kRReLU: {
         if (ctx.is_train) {
-          Random<xpu>* prnd = ctx.requested[leakyrelu::kRandom].get_random<xpu>(s);
+          Random<xpu>* prnd = ctx.requested[leakyrelu::kRandom].get_random<xpu, real_t>(s);
           mask = prnd->uniform(mask.shape_);
           mask = mask * (param_.upper_bound - param_.lower_bound) + param_.lower_bound;
           Assign(out, req[leakyrelu::kOut], F<mshadow_op::xelu>(data, mask));
@@ -177,7 +177,7 @@ class LeakyReLUOp : public Operator {
         weight = in_data[leakyrelu::kGamma].get<xpu, 1, real_t>(s);
         grad_weight = in_grad[leakyrelu::kGamma].get<xpu, 1, real_t>(s);
         grad_weight = sumall_except_dim<1>(F<prelu_grad>(data) * grad);
-        gdata = F<mshadow_op::xelu_grad>(output, broadcast<1>(weight, data.shape_)) * grad;
+        gdata = F<mshadow_op::xelu_grad>(data, broadcast<1>(weight, data.shape_)) * grad;
         break;
       }
       case leakyrelu::kRReLU: {

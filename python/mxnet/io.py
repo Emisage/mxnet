@@ -1,26 +1,106 @@
 # coding: utf-8
-# pylint: disable=invalid-name, protected-access, fixme, too-many-arguments, W0221, W0201
+# pylint: disable=invalid-name, protected-access, fixme, too-many-arguments, W0221, W0201, no-self-use, no-member
 
 """NDArray interface of mxnet"""
 from __future__ import absolute_import
-from collections import namedtuple, OrderedDict
+from collections import OrderedDict
 
-import ctypes
+import re
 import sys
-import numpy as np
+import ctypes
 import logging
+import threading
+import numpy as np
 from .base import _LIB
 from .base import c_array, c_str, mx_uint, py_str
 from .base import DataIterHandle, NDArrayHandle
 from .base import check_call, ctypes2docstring
 from .ndarray import NDArray
 from .ndarray import array
+from .ndarray import concatenate
+
+
+class LayoutMapper(object):
+    """A helper class to decide data layouts (which axis is batch_size dimension)."""
+    def get_layout_string(self, name):
+        """Get layout string for the given data name.
+
+        Paramseters
+        -----------
+        name : str
+            The name of a data, label or output tensor.
+
+        Returns
+        -------
+        The layout string. For example "NCHW". Returns None if
+        not known.
+        """
+        raise NotImplementedError()
+
+    def get_batch_axis(self, name):
+        """Get the dimension that corresponds to the batch size.
+
+        Parameters
+        ----------
+        name : str
+            The name of the blob (could be data, label or output names).
+
+        Returns
+        -------
+        An axis indicating the batch_size dimension. When data-parallelism is
+        used, the data will be automatically split and concatenate along the batch_size
+        dimension. Axis can be -1, which means the array thing will be copied for each
+        data-parallelism device.
+        """
+        raise NotImplementedError()
+
+
+class DefaultLayoutMapper(LayoutMapper):
+    """A default data layout mapper.
+
+    It decides the data layout by information encoded in name.
+    If a name contains the string :__layout_XXXXX__, then XXXXX
+    will be parsed as the layout string.
+    """
+    def __init__(self, default_batch_axis=0):
+        super(DefaultLayoutMapper, self).__init__()
+        self._default_batch_axis = default_batch_axis
+
+    LAYOUT_PATTERN = re.compile(r':__layout_([^_*])__')
+    def get_layout_string(self, name):
+        ret = DefaultLayoutMapper.LAYOUT_PATTERN.search(name)
+        if ret is None:
+            return None
+        return ret.group(1)
+
+    def get_batch_axis(self, name):
+        layout = self.get_layout_string(name)
+        if layout is None:
+            return self._default_batch_axis
+        # N indicate batch size. Note when N is not found,
+        # it returns -1, which is what we expect
+        return layout.find('N')
+
+
+class DataBatch(object):
+    """Default object for holding a mini-batch of data and related information."""
+    def __init__(self, data, label, pad=None, index=None,
+                 bucket_key=None, provide_data=None, provide_label=None):
+        self.data = data
+        self.label = label
+        self.pad = pad
+        self.index = index
+
+        # the following properties are only used when bucketing is used
+        self.bucket_key = bucket_key
+        self.provide_data = provide_data
+        self.provide_label = provide_label
 
 class DataIter(object):
     """DataIter object in mxnet. """
 
     def __init__(self):
-        pass
+        self.batch_size = 0
 
     def __iter__(self):
         return self
@@ -30,21 +110,27 @@ class DataIter(object):
         pass
 
     def next(self):
-        """Get next data batch from iterator
+        """Get next data batch from iterator. Equivalent to
+        self.iter_next()
+        DataBatch(self.getdata(), self.getlabel(), self.getpad(), None)
+
         Returns
         -------
-        data : NDArray
+        data : DataBatch
             The data of next batch.
-        label : NDArray
-            The label of next batch.
         """
-        pass
+        if self.iter_next():
+            return DataBatch(data=self.getdata(), label=self.getlabel(), \
+                    pad=self.getpad(), index=self.getindex())
+        else:
+            raise StopIteration
 
     def __next__(self):
         return self.next()
 
     def iter_next(self):
         """Iterate to next batch.
+
         Returns
         -------
         has_next : boolean
@@ -52,12 +138,9 @@ class DataIter(object):
         """
         pass
 
-    def getdata(self, index=0):
+    def getdata(self):
         """Get data of current batch.
-        Parameters
-        ----------
-        index : int
-            The index of data source to retrieve.
+
         Returns
         -------
         data : NDArray
@@ -67,24 +150,27 @@ class DataIter(object):
 
     def getlabel(self):
         """Get label of current batch.
+
         Returns
         -------
         label : NDArray
             The label of current batch.
         """
-        return self.getdata(-1)
+        pass
 
     def getindex(self):
-        """
-        Retures
+        """Get index of the current batch.
+
+        Returns
         -------
         index : numpy.array
             The index of current batch
         """
-        pass
+        return None
 
     def getpad(self):
         """Get the number of padding examples in current batch.
+
         Returns
         -------
         pad : int
@@ -92,8 +178,191 @@ class DataIter(object):
         """
         pass
 
+class ResizeIter(DataIter):
+    """Resize a DataIter to given number of batches per epoch.
+    May produce incomplete batch in the middle of an epoch due
+    to padding from internal iterator.
 
-DataBatch = namedtuple('DataBatch', ['data', 'label', 'pad', 'index'])
+    Parameters
+    ----------
+    data_iter : DataIter
+        Internal data iterator.
+    size : number of batches per epoch to resize to.
+    reset_internal : whether to reset internal iterator on ResizeIter.reset
+    """
+
+    def __init__(self, data_iter, size, reset_internal=True):
+        super(ResizeIter, self).__init__()
+        self.data_iter = data_iter
+        self.size = size
+        self.reset_internal = reset_internal
+        self.cur = 0
+        self.current_batch = None
+
+        self.provide_data = data_iter.provide_data
+        self.provide_label = data_iter.provide_label
+        self.batch_size = data_iter.batch_size
+
+    def reset(self):
+        self.cur = 0
+        if self.reset_internal:
+            self.data_iter.reset()
+
+    def iter_next(self):
+        if self.cur == self.size:
+            return False
+        try:
+            self.current_batch = self.data_iter.next()
+        except StopIteration:
+            self.data_iter.reset()
+            self.current_batch = self.data_iter.next()
+
+        self.cur += 1
+        return True
+
+    def getdata(self):
+        return self.current_batch.data
+
+    def getlabel(self):
+        return self.current_batch.label
+
+    def getindex(self):
+        return self.current_batch.index
+
+    def getpad(self):
+        return self.current_batch.pad
+
+class PrefetchingIter(DataIter):
+    """Base class for prefetching iterators. Takes one or more DataIters (
+    or any class with "reset" and "read" methods) and combine them with
+    prefetching. For example:
+
+    Parameters
+    ----------
+    iters : DataIter or list of DataIter
+        one or more DataIters (or any class with "reset" and "read" methods)
+    rename_data : None or list of dict
+        i-th element is a renaming map for i-th iter, in the form of
+        {'original_name' : 'new_name'}. Should have one entry for each entry
+        in iter[i].provide_data
+    rename_label : None or list of dict
+        Similar to rename_data
+
+    Examples
+    --------
+    iter = PrefetchingIter([NDArrayIter({'data': X1}), NDArrayIter({'data': X2})],
+                           rename_data=[{'data': 'data1'}, {'data': 'data2'}])
+    """
+    def __init__(self, iters, rename_data=None, rename_label=None):
+        super(PrefetchingIter, self).__init__()
+        if not isinstance(iters, list):
+            iters = [iters]
+        self.n_iter = len(iters)
+        assert self.n_iter > 0
+        self.iters = iters
+        self.rename_data = rename_data
+        self.rename_label = rename_label
+        self.batch_size = self.provide_data[0][1][0]
+        self.data_ready = [threading.Event() for i in range(self.n_iter)]
+        self.data_taken = [threading.Event() for i in range(self.n_iter)]
+        for e in self.data_taken:
+            e.set()
+        self.started = True
+        self.current_batch = [None for i in range(self.n_iter)]
+        self.next_batch = [None for i in range(self.n_iter)]
+        def prefetch_func(self, i):
+            """Thread entry"""
+            while True:
+                self.data_taken[i].wait()
+                if not self.started:
+                    break
+                try:
+                    self.next_batch[i] = self.iters[i].next()
+                except StopIteration:
+                    self.next_batch[i] = None
+                self.data_taken[i].clear()
+                self.data_ready[i].set()
+        self.prefetch_threads = [threading.Thread(target=prefetch_func, args=[self, i]) \
+                                 for i in range(self.n_iter)]
+        for thread in self.prefetch_threads:
+            thread.setDaemon(True)
+            thread.start()
+
+    def __del__(self):
+        self.started = False
+        for e in self.data_taken:
+            e.set()
+        for thread in self.prefetch_threads:
+            thread.join()
+
+    @property
+    def provide_data(self):
+        """The name and shape of data provided by this iterator"""
+        if self.rename_data is None:
+            return sum([i.provide_data for i in self.iters], [])
+        else:
+            return sum([[(r[n], s) for n, s in i.provide_data] \
+                       for r, i in zip(self.rename_data, self.iters)], [])
+
+    @property
+    def provide_label(self):
+        """The name and shape of label provided by this iterator"""
+        if self.rename_label is None:
+            return sum([i.provide_label for i in self.iters], [])
+        else:
+            return sum([[(r[n], s) for n, s in i.provide_label] \
+                       for r, i in zip(self.rename_label, self.iters)], [])
+
+    def reset(self):
+        for e in self.data_ready:
+            e.wait()
+        for i in self.iters:
+            i.reset()
+        for e in self.data_ready:
+            e.clear()
+        for e in self.data_taken:
+            e.set()
+
+    def iter_next(self):
+        for e in self.data_ready:
+            e.wait()
+        if self.next_batch[0] is None:
+            for i in self.next_batch:
+                assert i is None, "Number of entry mismatches between iterators"
+            return False
+        else:
+            for batch in self.next_batch:
+                assert batch.pad == self.next_batch[0].pad, \
+                    "Number of entry mismatches between iterators"
+            self.current_batch = DataBatch(sum([batch.data for batch in self.next_batch], []),
+                                           sum([batch.label for batch in self.next_batch], []),
+                                           self.next_batch[0].pad,
+                                           self.next_batch[0].index,
+                                           provide_data=self.provide_data,
+                                           provide_label=self.provide_label)
+            for e in self.data_ready:
+                e.clear()
+            for e in self.data_taken:
+                e.set()
+            return True
+
+    def next(self):
+        if self.iter_next():
+            return self.current_batch
+        else:
+            raise StopIteration
+
+    def getdata(self):
+        return self.current_batch.data
+
+    def getlabel(self):
+        return self.current_batch.label
+
+    def getindex(self):
+        return self.current_batch.index
+
+    def getpad(self):
+        return self.current_batch.pad
 
 def _init_data(data, allow_empty, default_name):
     """Convert data into canonical form."""
@@ -114,11 +383,11 @@ def _init_data(data, allow_empty, default_name):
         raise TypeError("Input must be NDArray, numpy.ndarray, " + \
                 "a list of them or dict with them as values")
     for k, v in data.items():
-        if isinstance(v, NDArray):
-            data[k] = v.asnumpy()
-    for k, v in data.items():
-        if not isinstance(v, np.ndarray):
-            raise TypeError(("Invalid type '%s' for %s, "  % (type(v), k)) + \
+        if not isinstance(v, NDArray):
+            try:
+                data[k] = array(v)
+            except:
+                raise TypeError(("Invalid type '%s' for %s, "  % (type(v), k)) + \
                     "should be NDArray or numpy.ndarray")
 
     return list(data.items())
@@ -135,10 +404,6 @@ class NDArrayIter(DataIter):
         Batch Size
     shuffle: bool
         Whether to shuffle the data
-    data_pad_value: float, optional
-        Padding value for data
-    label_pad_value: float, optionl
-        Padding value for label
     last_batch_handle: 'pad', 'discard' or 'roll_over'
         How to handle the last batch
     Note
@@ -159,22 +424,26 @@ class NDArrayIter(DataIter):
         if shuffle:
             idx = np.arange(self.data[0][1].shape[0])
             np.random.shuffle(idx)
-            self.data = [(k, v[idx]) for k, v in self.data]
-            self.label = [(k, v[idx]) for k, v in self.label]
-
-        self.data_list = [x[1] for x in self.data] + [x[1] for x in self.label]
-        self.num_source = len(self.data_list)
+            self.data = [(k, array(v.asnumpy()[idx], v.context)) for k, v in self.data]
+            self.label = [(k, array(v.asnumpy()[idx], v.context)) for k, v in self.label]
 
         # batching
         if last_batch_handle == 'discard':
-            new_n = self.data_list[0].shape[0] - self.data_list[0].shape[0] % batch_size
+            new_n = self.data[0][1].shape[0] - self.data[0][1].shape[0] % batch_size
+            data_dict = OrderedDict(self.data)
+            label_dict = OrderedDict(self.label)
             for k, _ in self.data:
-                self.data[k] = self.data[k][:new_n]
+                data_dict[k] = data_dict[k][:new_n]
             for k, _ in self.label:
-                self.label[k] = self.label[k][:new_n]
+                label_dict[k] = label_dict[k][:new_n]
+            self.data = data_dict.items()
+            self.label = label_dict.items()
+
+        self.data_list = [x[1] for x in self.data] + [x[1] for x in self.label]
+        self.num_source = len(self.data_list)
         self.num_data = self.data_list[0].shape[0]
         assert self.num_data >= batch_size, \
-            "batch_size need to be smaller than data size when not padding."
+            "batch_size need to be smaller than data size."
         self.cursor = -batch_size
         self.batch_size = batch_size
         self.last_batch_handle = last_batch_handle
@@ -202,10 +471,7 @@ class NDArrayIter(DataIter):
 
     def iter_next(self):
         self.cursor += self.batch_size
-        if self.cursor < self.num_data:
-            return True
-        else:
-            return False
+        return self.cursor < self.num_data
 
     def next(self):
         if self.iter_next():
@@ -218,11 +484,10 @@ class NDArrayIter(DataIter):
         """Load data from underlying arrays, internal use only"""
         assert(self.cursor < self.num_data), "DataIter needs reset."
         if self.cursor + self.batch_size <= self.num_data:
-            return [array(x[1][self.cursor:self.cursor+self.batch_size]) for x in data_source]
+            return [x[1][self.cursor:self.cursor+self.batch_size] for x in data_source]
         else:
             pad = self.batch_size - self.num_data + self.cursor
-            return [array(np.concatenate((x[1][self.cursor:], x[1][:pad]),
-                                         axis=0)) for x in data_source]
+            return [concatenate([x[1][self.cursor:], x[1][:pad]]) for x in data_source]
 
     def getdata(self):
         return self._getdata(self.data)

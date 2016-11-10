@@ -19,11 +19,17 @@ Bias parameter.}
 \item{kernel}{Shape(tuple), required
 deconvolution kernel size: (y, x)}
 
-\item{stride}{Shape(tuple), optional, default=(1, 1)
+\item{stride}{Shape(tuple), optional, default=(1,1)
 deconvolution stride: (y, x)}
 
-\item{pad}{Shape(tuple), optional, default=(0, 0)
-pad for deconvolution: (y, x)}
+\item{pad}{Shape(tuple), optional, default=(0,0)
+pad for deconvolution: (y, x), a good number is : (kernel-1)/2, if target_shape set, pad will be ignored and will be computed automatically}
+
+\item{adj}{Shape(tuple), optional, default=(0,0)
+adjustment for output shape: (y, x), if target_shape set, adj will be ignored and will be computed automatically}
+
+\item{target.shape}{Shape(tuple), optional, default=(0,0)
+output shape with targe shape : (y, x)}
 
 \item{num.filter}{int (non-negative), required
 deconvolution filter(channel) number}

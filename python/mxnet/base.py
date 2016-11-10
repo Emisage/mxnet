@@ -1,12 +1,12 @@
 # coding: utf-8
-# pylint: disable=invalid-name
+# pylint: disable=invalid-name, no-member
 """ ctypes library of mxnet and helper functions """
 from __future__ import absolute_import
 
 import sys
 import ctypes
-import numpy as np
 import atexit
+import numpy as np
 from . import libinfo
 
 __all__ = ['MXNetError']
@@ -15,13 +15,13 @@ __all__ = ['MXNetError']
 #----------------------------
 if sys.version_info[0] == 3:
     string_types = str,
-    numeric_types = (float, int)
+    numeric_types = (float, int, np.float32, np.int32)
     # this function is needed for python3
     # to convert ctypes.char_p .value back to python str
     py_str = lambda x: x.decode('utf-8')
 else:
     string_types = basestring,
-    numeric_types = (float, int, long)
+    numeric_types = (float, int, long, np.float32, np.int32)
     py_str = lambda x: x
 
 
@@ -46,6 +46,7 @@ _LIB = _load_lib()
 mx_uint = ctypes.c_uint
 mx_float = ctypes.c_float
 mx_float_p = ctypes.POINTER(mx_float)
+mx_real_t = np.float32
 NDArrayHandle = ctypes.c_void_p
 FunctionHandle = ctypes.c_void_p
 SymbolCreatorHandle = ctypes.c_void_p
@@ -56,6 +57,8 @@ DataIterHandle = ctypes.c_void_p
 KVStoreHandle = ctypes.c_void_p
 RecordIOHandle = ctypes.c_void_p
 RtcHandle = ctypes.c_void_p
+OptimizerHandle = ctypes.c_void_p
+OptimizerCreator = ctypes.c_void_p
 #----------------------------
 # helper function definition
 #----------------------------
@@ -73,19 +76,34 @@ def check_call(ret):
     if ret != 0:
         raise MXNetError(py_str(_LIB.MXGetLastError()))
 
-def c_str(string):
-    """Create ctypes char * from a python string
-    Parameters
-    ----------
-    string : string type
-        python string
+if sys.version_info[0] < 3:
+    def c_str(string):
+        """Create ctypes char * from a python string
+        Parameters
+        ----------
+        string : string type
+            python string
 
-    Returns
-    -------
-    str : c_char_p
-        A char pointer that can be passed to C API
-    """
-    return ctypes.c_char_p(string.encode('utf-8'))
+        Returns
+        -------
+        str : c_char_p
+            A char pointer that can be passed to C API
+        """
+        return ctypes.c_char_p(string)
+else:
+    def c_str(string):
+        """Create ctypes char * from a python string
+        Parameters
+        ----------
+        string : string type
+            python string
+
+        Returns
+        -------
+        str : c_char_p
+            A char pointer that can be passed to C API
+        """
+        return ctypes.c_char_p(string.encode('utf-8'))
 
 
 def c_array(ctype, values):

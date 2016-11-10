@@ -7,7 +7,7 @@ from .base import string_types
 class AttrScope(object):
     """Attribute manager for scoping.
 
-    User can also inheritate this object to change naming behavior.
+    User can also inherit this object to change naming behavior.
 
     Parameters
     ----------
@@ -59,4 +59,3 @@ class AttrScope(object):
         AttrScope.current = self._old_scope
 
 AttrScope.current = AttrScope()
-

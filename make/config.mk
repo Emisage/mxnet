@@ -40,13 +40,16 @@ ADD_CFLAGS =
 # whether use CUDA during compile
 USE_CUDA = 0
 
-# add the path to CUDA libary to link and compile flag
-# if you have already add them to enviroment variable, leave it as NONE
+# add the path to CUDA library to link and compile flag
+# if you have already add them to environment variable, leave it as NONE
 # USE_CUDA_PATH = /usr/local/cuda
 USE_CUDA_PATH = NONE
 
-# whether use CUDNN R3 library
+# whether use CuDNN R3 library
 USE_CUDNN = 0
+
+# whether use cuda runtime compiling for writing kernels in native language (i.e. Python)
+USE_NVRTC = 0
 
 # whether use opencv during compilation
 # you can disable it, however, you will not able to use
@@ -55,6 +58,16 @@ USE_OPENCV = 1
 
 # use openmp for parallelization
 USE_OPENMP = 1
+
+# whether use MKL2017 library
+USE_MKL2017 = 0
+
+# whether use MKL2017 experimental feature for high performance
+USE_MKL2017_EXPERIMENTAL = 0
+
+# whether use NNPACK library
+USE_NNPACK = 0
+USE_NNPACK_NUM_THREADS = 4
 
 # choose the version of blas you want to use
 # can be: mkl, blas, atlas, openblas
@@ -66,11 +79,11 @@ else
 USE_BLAS = atlas
 endif
 
-# add path to intel libary, you may need it for MKL, if you did not add the path
-# to enviroment variable
+# add path to intel library, you may need it for MKL, if you did not add the path
+# to environment variable
 USE_INTEL_PATH = NONE
 
-# If use MKL, choose static link automaticly to allow python wrapper
+# If use MKL, choose static link automatically to allow python wrapper
 ifeq ($(USE_BLAS), mkl)
 USE_STATIC_MKL = 1
 else
@@ -78,10 +91,20 @@ USE_STATIC_MKL = NONE
 endif
 
 #----------------------------
+# Settings for power and arm arch
+#----------------------------
+ARCH := $(shell uname -a)
+ifneq (,$(filter $(ARCH), armv6l armv7l powerpc64le ppc64le aarch64))
+	USE_SSE=0
+else
+	USE_SSE=1
+endif
+
+#----------------------------
 # distributed computing
 #----------------------------
 
-# whether or not to enable mullti-machine supporting
+# whether or not to enable multi-machine supporting
 USE_DIST_KVSTORE = 0
 
 # whether or not allow to read and write HDFS directly. If yes, then hadoop is
@@ -95,3 +118,33 @@ LIBJVM=$(JAVA_HOME)/jre/lib/amd64/server
 # libcurl4-openssl-dev is required, it can be installed on Ubuntu by
 # sudo apt-get install -y libcurl4-openssl-dev
 USE_S3 = 0
+
+#----------------------------
+# additional operators
+#----------------------------
+
+# path to folders containing projects specific operators that you don't want to put in src/operators
+EXTRA_OPERATORS =
+
+
+#----------------------------
+# plugins
+#----------------------------
+
+# whether to use caffe integration. This requires installing caffe.
+# You also need to add CAFFE_PATH/build/lib to your LD_LIBRARY_PATH
+# CAFFE_PATH = $(HOME)/caffe
+# MXNET_PLUGINS += plugin/caffe/caffe.mk
+
+# whether to use torch integration. This requires installing torch.
+# You also need to add TORCH_PATH/install/lib to your LD_LIBRARY_PATH
+# TORCH_PATH = $(HOME)/torch
+# MXNET_PLUGINS += plugin/torch/torch.mk
+
+# WARPCTC_PATH = $(HOME)/warp-ctc
+# MXNET_PLUGINS += plugin/warpctc/warpctc.mk
+
+# whether to use sframe integration. This requires build sframe
+# git@github.com:dato-code/SFrame.git
+# SFRAME_PATH = $(HOME)/SFrame
+# MXNET_PLUGINS += plugin/sframe/plugin.mk

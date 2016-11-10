@@ -7,6 +7,8 @@
 #include <dmlc/base.h>
 #include <dmlc/io.h>
 #include <dmlc/omp.h>
+#include <dmlc/common.h>
+#include <dmlc/input_split_shuffle.h>
 #include <dmlc/logging.h>
 #include <dmlc/parameter.h>
 #include <dmlc/recordio.h>
@@ -93,6 +95,8 @@ struct ImageRecParserParam : public dmlc::Parameter<ImageRecParserParam> {
   std::string path_imglist;
   /*! \brief path to image recordio */
   std::string path_imgrec;
+  /*! \brief a sequence of names of image augmenters, seperated by , */
+  std::string aug_seq;
   /*! \brief label-width */
   int label_width;
   /*! \brief input shape */
@@ -105,6 +109,10 @@ struct ImageRecParserParam : public dmlc::Parameter<ImageRecParserParam> {
   int num_parts;
   /*! \brief the index of the part will read*/
   int part_index;
+  /*! \brief the size of a shuffle chunk*/
+  size_t shuffle_chunk_size;
+  /*! \brief the seed for chunk shuffling*/
+  int shuffle_chunk_seed;
 
   // declare parameters
   DMLC_DECLARE_PARAMETER(ImageRecParserParam) {
@@ -112,6 +120,10 @@ struct ImageRecParserParam : public dmlc::Parameter<ImageRecParserParam> {
         .describe("Dataset Param: Path to image list.");
     DMLC_DECLARE_FIELD(path_imgrec).set_default("./data/imgrec.rec")
         .describe("Dataset Param: Path to image record file.");
+    DMLC_DECLARE_FIELD(aug_seq).set_default("aug_default")
+        .describe("Augmentation Param: the augmenter names to represent"\
+                  " sequence of augmenters to be applied, seperated by comma." \
+                  " Additional keyword parameters will be seen by these augmenters.");
     DMLC_DECLARE_FIELD(label_width).set_lower_bound(1).set_default(1)
         .describe("Dataset Param: How many labels for an image.");
     DMLC_DECLARE_FIELD(data_shape)
@@ -125,27 +137,17 @@ struct ImageRecParserParam : public dmlc::Parameter<ImageRecParserParam> {
         .describe("partition the data into multiple parts");
     DMLC_DECLARE_FIELD(part_index).set_default(0)
         .describe("the index of the part will read");
+    DMLC_DECLARE_FIELD(shuffle_chunk_size).set_default(0)
+        .describe("the size(MB) of the shuffle chunk, used with shuffle=True,"\
+                  " it can enable global shuffling");
+    DMLC_DECLARE_FIELD(shuffle_chunk_seed).set_default(0)
+        .describe("the seed for chunk shuffling");
   }
 };
 
 // parser to parse image recordio
 class ImageRecordIOParser {
  public:
-  ImageRecordIOParser(void)
-      : source_(nullptr),
-        label_map_(nullptr) {
-  }
-  ~ImageRecordIOParser(void) {
-    // can be nullptr
-    delete label_map_;
-    delete source_;
-    for (size_t i = 0; i < augmenters_.size(); ++i) {
-      delete augmenters_[i];
-    }
-    for (size_t i = 0; i < prnds_.size(); ++i) {
-      delete prnds_[i];
-    }
-  }
   // initialize the parser
   inline void Init(const std::vector<std::pair<std::string, std::string> >& kwargs);
 
@@ -162,20 +164,22 @@ class ImageRecordIOParser {
   static const int kRandMagic = 111;
   /*! \brief parameters */
   ImageRecParserParam param_;
+  #if MXNET_USE_OPENCV
   /*! \brief augmenters */
-  std::vector<ImageAugmenter*> augmenters_;
+  std::vector<std::vector<std::unique_ptr<ImageAugmenter> > > augmenters_;
+  #endif
   /*! \brief random samplers */
-  std::vector<common::RANDOM_ENGINE*> prnds_;
+  std::vector<std::unique_ptr<common::RANDOM_ENGINE> > prnds_;
   /*! \brief data source */
-  dmlc::InputSplit *source_;
+  std::unique_ptr<dmlc::InputSplit> source_;
   /*! \brief label information, if any */
-  ImageLabelMap *label_map_;
+  std::unique_ptr<ImageLabelMap> label_map_;
   /*! \brief temp space */
   mshadow::TensorContainer<cpu, 3> img_;
 };
 
 inline void ImageRecordIOParser::Init(
-        const std::vector<std::pair<std::string, std::string> >& kwargs) {
+    const std::vector<std::pair<std::string, std::string> >& kwargs) {
 #if MXNET_USE_OPENCV
   // initialize parameter
   // init image rec param
@@ -193,17 +197,20 @@ inline void ImageRecordIOParser::Init(
   }
   param_.preprocess_threads = threadget;
 
+  std::vector<std::string> aug_names = dmlc::Split(param_.aug_seq, ',');
+  augmenters_.clear();
+  augmenters_.resize(threadget);
   // setup decoders
   for (int i = 0; i < threadget; ++i) {
-    augmenters_.push_back(new ImageAugmenter());
-    augmenters_[i]->Init(kwargs);
-    prnds_.push_back(new common::RANDOM_ENGINE((i + 1) * kRandMagic));
+    for (const auto& aug_name : aug_names) {
+      augmenters_[i].emplace_back(ImageAugmenter::Create(aug_name));
+      augmenters_[i].back()->Init(kwargs);
+    }
+    prnds_.emplace_back(new common::RANDOM_ENGINE((i + 1) * kRandMagic));
   }
   if (param_.path_imglist.length() != 0) {
-    label_map_ = new ImageLabelMap(param_.path_imglist.c_str(),
-                                   param_.label_width, !param_.verbose);
-  } else {
-    param_.label_width = 1;
+    label_map_.reset(new ImageLabelMap(param_.path_imglist.c_str(),
+      param_.label_width, !param_.verbose));
   }
   CHECK(param_.path_imgrec.length() != 0)
       << "ImageRecordIOIterator: must specify image_rec";
@@ -212,11 +219,35 @@ inline void ImageRecordIOParser::Init(
     LOG(INFO) << "ImageRecordIOParser: " << param_.path_imgrec
               << ", use " << threadget << " threads for decoding..";
   }
-  source_ = dmlc::InputSplit::Create(
+  source_.reset(dmlc::InputSplit::Create(
       param_.path_imgrec.c_str(), param_.part_index,
-      param_.num_parts, "recordio");
-  // use 64 MB chunk when possible
-  source_->HintChunkSize(8 << 20UL);
+      param_.num_parts, "recordio"));
+  if (param_.shuffle_chunk_size > 0) {
+    if (param_.shuffle_chunk_size > 4096) {
+      LOG(INFO) << "Chunk size: " << param_.shuffle_chunk_size
+                 << " MB which is larger than 4096 MB, please set "
+                    "smaller chunk size";
+    }
+    if (param_.shuffle_chunk_size < 4) {
+      LOG(INFO) << "Chunk size: " << param_.shuffle_chunk_size
+                 << " MB which is less than 4 MB, please set "
+                    "larger chunk size";
+    }
+    // 1.1 ratio is for a bit more shuffle parts to avoid boundary issue
+    unsigned num_shuffle_parts =
+        std::ceil(source_->GetTotalSize() * 1.1 /
+                  (param_.num_parts * (param_.shuffle_chunk_size << 20UL)));
+
+    if (num_shuffle_parts > 1) {
+      source_.reset(dmlc::InputSplitShuffle::Create(
+          param_.path_imgrec.c_str(), param_.part_index,
+          param_.num_parts, "recordio", num_shuffle_parts, param_.shuffle_chunk_seed));
+    }
+    source_->HintChunkSize(param_.shuffle_chunk_size << 17UL);
+  } else {
+    // use 64 MB chunk when possible
+    source_->HintChunkSize(8 << 20UL);
+  }
 #else
   LOG(FATAL) << "ImageRec need opencv to process";
 #endif
@@ -245,25 +276,48 @@ ParseNext(std::vector<InstVector> *out_vec) {
       cv::Mat res;
       rec.Load(blob.dptr, blob.size);
       cv::Mat buf(1, rec.content_size, CV_8U, rec.content);
-      res = cv::imdecode(buf, 1);
-      res = augmenters_[tid]->Process(res, prnds_[tid]);
+      // -1 to keep the number of channel of the encoded image, and not force gray or color.
+      res = cv::imdecode(buf, -1);
+      const int n_channels = res.channels();
+      for (auto& aug : augmenters_[tid]) {
+        res = aug->Process(res, prnds_[tid].get());
+      }
       out.Push(static_cast<unsigned>(rec.image_index()),
-               mshadow::Shape3(3, res.rows, res.cols),
+               mshadow::Shape3(n_channels, res.rows, res.cols),
                mshadow::Shape1(param_.label_width));
 
       mshadow::Tensor<cpu, 3> data = out.data().Back();
+
+      // For RGB or RGBA data, swap the B and R channel:
+      // OpenCV store as BGR (or BGRA) and we want RGB (or RGBA)
+      std::vector<int> swap_indices;
+      if (n_channels == 1) swap_indices = {0};
+      if (n_channels == 3) swap_indices = {2, 1, 0};
+      if (n_channels == 4) swap_indices = {2, 1, 0, 3};
+
       for (int i = 0; i < res.rows; ++i) {
+        uchar* im_data = res.ptr<uchar>(i);
         for (int j = 0; j < res.cols; ++j) {
-          cv::Vec3b bgr = res.at<cv::Vec3b>(i, j);
-          data[0][i][j] = bgr[2];
-          data[1][i][j] = bgr[1];
-          data[2][i][j] = bgr[0];
+          for (int k = 0; k < n_channels; ++k) {
+              data[k][i][j] = im_data[swap_indices[k]];
+          }
+          im_data += n_channels;
         }
       }
+
       mshadow::Tensor<cpu, 1> label = out.label().Back();
       if (label_map_ != nullptr) {
         mshadow::Copy(label, label_map_->Find(rec.image_index()));
+      } else if (rec.label != NULL) {
+        CHECK_EQ(param_.label_width, rec.num_label)
+          << "rec file provide " << rec.num_label << "-dimensional label "
+             "but label_width is set to " << param_.label_width;
+        mshadow::Copy(label, mshadow::Tensor<cpu, 1>(rec.label,
+                                                     mshadow::Shape1(rec.num_label)));
       } else {
+        CHECK_EQ(param_.label_width, 1)
+          << "label_width must be 1 unless an imglist is provided "
+             "or the rec file is packed with multi dimensional label";
         label[0] = rec.header.label;
       }
       res.release();
@@ -389,7 +443,7 @@ MXNET_REGISTER_IO_ITER(ImageRecordIter)
 .add_arguments(ImageRecordParam::__FIELDS__())
 .add_arguments(BatchParam::__FIELDS__())
 .add_arguments(PrefetcherParam::__FIELDS__())
-.add_arguments(ImageAugmentParam::__FIELDS__())
+.add_arguments(ListDefaultAugParams())
 .add_arguments(ImageNormalizeParam::__FIELDS__())
 .set_body([]() {
     return new PrefetcherIter(

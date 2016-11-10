@@ -5,10 +5,12 @@
 \title{Create a MXNet Feedforward neural net model with the specified training.}
 \usage{
 mx.model.FeedForward.create(symbol, X, y = NULL, ctx = NULL,
-  num.round = 10, optimizer = "sgd", initializer = mx.init.uniform(0.01),
-  eval.data = NULL, eval.metric = NULL, epoch.end.callback = NULL,
+  begin.round = 1, num.round = 10, optimizer = "sgd",
+  initializer = mx.init.uniform(0.01), eval.data = NULL,
+  eval.metric = NULL, epoch.end.callback = NULL,
   batch.end.callback = NULL, array.batch.size = 128,
-  array.layout = "auto", kvstore = "local", ...)
+  array.layout = "auto", kvstore = "local", verbose = TRUE,
+  arg.params = NULL, aux.params = NULL, ...)
 }
 \arguments{
 \item{symbol}{The symbolic configuration of the neural network.}
@@ -21,6 +23,9 @@ This is only used when X is R array.}
 
 \item{ctx}{mx.context or list of mx.context, optional
 The devices used to perform training.}
+
+\item{begin.round}{integer (default=1)
+The initial iteration over the training data to train the model.}
 
 \item{num.round}{integer (default=10)
 The number of iterations over training data to train the model.}
@@ -55,6 +60,15 @@ For matrix, "rowmajor" means dim(X) = c(nexample, nfeatures),
 
 \item{kvstore}{string (default="local")
 The parameter synchronization scheme in multiple devices.}
+
+\item{verbose}{logical (default=TRUE)
+Specifies whether to print information on the iterations during training.}
+
+\item{arg.params}{list, optional
+Model parameter, list of name to NDArray of net's weights.}
+
+\item{aux.params}{list, optional
+Model parameter, list of name to NDArray of net's auxiliary states.}
 }
 \value{
 model A trained mxnet model.

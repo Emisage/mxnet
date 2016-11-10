@@ -32,6 +32,7 @@
 doc/html
 doc/latex
 doc/doc
+docs/web-data
 
 #dmlc
 config.mk
@@ -73,6 +74,8 @@ deps
 .Rproj.user
 R-package/inst/*
 *.tar.gz
+*.tgz
+R-package/man/*.Rd
 
 # data
 *.rec
@@ -80,10 +83,12 @@ R-package/inst/*
 *.zip
 *ubyte
 *.bin
+*.txt
 
 # ipython notebook
-example/notebooks/.ipynb_checkpoints/*
 *_pb2.py
+*.ipynb_checkpoints*
+input.txt*
 
 # Jetbrain
 .idea
@@ -91,3 +96,31 @@ example/notebooks/.ipynb_checkpoints/*
 # ctags
 tags
 
+# Scala package
+*.class
+scala-package/*/target/
+scala-package/*/*/target/
+*.scala_dependencies
+*.worksheet
+*.idea
+*.iml
+*.classpath
+*.project
+*.settings
+!scala-package/*/bin
+*.bak
+*/node_modules/
+
+# Eclipse project config
+.project
+.cproject
+.pydevproject
+CMakeFiles
+cmake_install.cmake
+dmlc-core
+ps-lite
+nnvm
+lib
+
+# Visual Studio Code
+.vscode
